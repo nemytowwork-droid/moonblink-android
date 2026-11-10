@@ -1,3 +1,4 @@
+
 package com.moonblink.app
 
 import android.Manifest
@@ -133,6 +134,9 @@ class MainActivity : ComponentActivity() {
                 MoonblinkScreen()
             }
         }
+
+        // Автоматически запрашиваем разрешения и запускаем поиск
+        requestOnline()
     }
 
     private fun requiredPermissions(): Array<String> {
