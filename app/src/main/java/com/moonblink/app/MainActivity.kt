@@ -1,4 +1,3 @@
-
 package com.moonblink.app
 
 import android.Manifest
@@ -9,7 +8,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -40,6 +38,7 @@ private val Mint = Color(0xFF55E6D0)
 private val Muted = Color(0xFF8B9BB4)
 
 private const val SERVICE_ID = "com.moonblink.app"
+private const val MAX_MESSAGES = 100
 
 data class NearbyPeer(
     val endpointId: String,
@@ -67,7 +66,12 @@ class MainActivity : ComponentActivity() {
     private var localName = "Пользователь"
 
     private var online by mutableStateOf(false)
+    private var startingNearby by mutableStateOf(false)
     private var status by mutableStateOf("Не в сети")
+
+    private var advertisingReady = false
+    private var discoveryReady = false
+    private var startAttempt = 0
 
     private val peers = mutableStateListOf<NearbyPeer>()
     private val connected = mutableStateMapOf<String, String>()
@@ -173,6 +177,48 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun readableDeviceName(rawName: String): String {
+        return rawName.substringAfter("|", rawName)
+            .ifBlank { "Устройство Moonblink" }
+    }
+
+    private fun updateNearbyState() {
+        if (advertisingReady && discoveryReady) {
+            online = true
+            startingNearby = false
+            status = "Ищем устройства поблизости"
+        } else {
+            online = false
+
+            status = when {
+                advertisingReady ->
+                    "Видимость включена, запускаем поиск..."
+
+                discoveryReady ->
+                    "Поиск включён, ожидаем видимость..."
+
+                else ->
+                    "Запускаем поиск устройств..."
+            }
+        }
+    }
+
+    private fun failNearby(message: String, attempt: Int) {
+        if (attempt != startAttempt) return
+
+        startAttempt++
+
+        connections.stopAdvertising()
+        connections.stopDiscovery()
+
+        advertisingReady = false
+        discoveryReady = false
+        startingNearby = false
+        online = false
+
+        status = message
+    }
+
     private val payloadCallback = object : PayloadCallback() {
 
         override fun onPayloadReceived(
@@ -191,11 +237,14 @@ class MainActivity : ComponentActivity() {
                 if (json.optString("type") != "text") return
 
                 val text = json.optString("text")
-                val sender = json.optString("senderName", "Соседнее устройство")
+                val sender = json.optString(
+                    "senderName",
+                    "Соседнее устройство"
+                )
 
                 if (text.isNotBlank()) {
                     runOnUiThread {
-                        messages.add(
+                        appendMessage(
                             ChatLine(
                                 text = text,
                                 sender = sender,
@@ -203,7 +252,7 @@ class MainActivity : ComponentActivity() {
                             )
                         )
 
-                        saveMessages()
+                        status = "Получено новое сообщение"
                     }
                 }
             } catch (_: Exception) {
@@ -219,7 +268,7 @@ class MainActivity : ComponentActivity() {
         ) {
             if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
                 runOnUiThread {
-                    status = "Сообщение передано"
+                    status = "Передача данных завершена"
                 }
             }
         }
@@ -232,13 +281,13 @@ class MainActivity : ComponentActivity() {
                 endpointId: String,
                 info: ConnectionInfo
             ) {
-                val endpointName = info.endpointName
-                endpointNames[endpointId] = endpointName
+                val name = readableDeviceName(info.endpointName)
+                endpointNames[endpointId] = name
 
                 runOnUiThread {
                     pendingRequest = PendingRequest(
                         endpointId = endpointId,
-                        name = endpointName,
+                        name = name,
                         digits = info.authenticationDigits
                     )
                 }
@@ -251,7 +300,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     if (result.status.isSuccess) {
                         val name = endpointNames[endpointId]
-                            ?: "Moonblink"
+                            ?: "Устройство Moonblink"
 
                         connected[endpointId] = name
 
@@ -262,6 +311,10 @@ class MainActivity : ComponentActivity() {
                         status = "Устройство подключено: $name"
                     } else {
                         status = "Не удалось установить соединение"
+                    }
+
+                    if (pendingRequest?.endpointId == endpointId) {
+                        pendingRequest = null
                     }
                 }
             }
@@ -283,13 +336,15 @@ class MainActivity : ComponentActivity() {
                 info: DiscoveredEndpointInfo
             ) {
                 runOnUiThread {
-                    if (connected.containsKey(endpointId)) return@runOnUiThread
+                    if (connected.containsKey(endpointId)) {
+                        return@runOnUiThread
+                    }
 
                     if (peers.none { it.endpointId == endpointId }) {
                         peers.add(
                             NearbyPeer(
-                                endpointId,
-                                info.endpointName
+                                endpointId = endpointId,
+                                name = readableDeviceName(info.endpointName)
                             )
                         )
                     }
@@ -306,7 +361,20 @@ class MainActivity : ComponentActivity() {
         }
 
     private fun startNearby() {
-        if (online) return
+        if (online || startingNearby) return
+
+        if (!hasPermissions()) {
+            requestOnline()
+            return
+        }
+
+        startingNearby = true
+        online = false
+
+        advertisingReady = false
+        discoveryReady = false
+
+        val attempt = ++startAttempt
 
         status = "Запускаем поиск устройств..."
 
@@ -326,13 +394,16 @@ class MainActivity : ComponentActivity() {
             connectionCallback,
             advertisingOptions
         ).addOnSuccessListener {
-            runOnUiThread {
-                status = "Видимость включена"
-            }
+            if (attempt != startAttempt) return@addOnSuccessListener
+
+            advertisingReady = true
+            updateNearbyState()
+
         }.addOnFailureListener { error ->
-            runOnUiThread {
-                status = "Ошибка видимости: ${error.localizedMessage}"
-            }
+            failNearby(
+                "Ошибка видимости: ${error.localizedMessage}",
+                attempt
+            )
         }
 
         connections.startDiscovery(
@@ -340,23 +411,32 @@ class MainActivity : ComponentActivity() {
             discoveryCallback,
             discoveryOptions
         ).addOnSuccessListener {
-            runOnUiThread {
-                online = true
-                status = "Ищем устройства поблизости"
-            }
+            if (attempt != startAttempt) return@addOnSuccessListener
+
+            discoveryReady = true
+            updateNearbyState()
+
         }.addOnFailureListener { error ->
-            runOnUiThread {
-                status = "Ошибка поиска: ${error.localizedMessage}"
-            }
+            failNearby(
+                "Ошибка поиска: ${error.localizedMessage}",
+                attempt
+            )
         }
     }
 
     private fun stopNearby() {
+        startAttempt++
+
         connections.stopAdvertising()
         connections.stopDiscovery()
         connections.stopAllEndpoints()
 
+        advertisingReady = false
+        discoveryReady = false
+
+        startingNearby = false
         online = false
+
         peers.clear()
         connected.clear()
         endpointNames.clear()
@@ -394,9 +474,14 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 status = "Не удалось принять подключение: ${error.localizedMessage}"
             }
+        }.addOnSuccessListener {
+            runOnUiThread {
+                status = "Запрос принят, устанавливаем соединение..."
+                if (pendingRequest?.endpointId == request.endpointId) {
+                    pendingRequest = null
+                }
+            }
         }
-
-        pendingRequest = null
     }
 
     private fun rejectPending() {
@@ -408,14 +493,24 @@ class MainActivity : ComponentActivity() {
         status = "Запрос отклонён"
     }
 
-    private fun sendMessage(text: String) {
+    private fun appendMessage(message: ChatLine) {
+        messages.add(message)
+
+        while (messages.size > MAX_MESSAGES) {
+            messages.removeAt(0)
+        }
+
+        saveMessages()
+    }
+
+    private fun sendMessage(text: String): Boolean {
         val cleanText = text.trim()
 
-        if (cleanText.isEmpty()) return
+        if (cleanText.isEmpty()) return false
 
         if (connected.isEmpty()) {
             status = "Сначала подключи соседнее устройство"
-            return
+            return false
         }
 
         val json = JSONObject()
@@ -429,15 +524,13 @@ class MainActivity : ComponentActivity() {
             json.toString().toByteArray(StandardCharsets.UTF_8)
         )
 
-        messages.add(
+        appendMessage(
             ChatLine(
                 text = cleanText,
                 sender = "Ты",
                 mine = true
             )
         )
-
-        saveMessages()
 
         connected.keys.toList().forEach { endpointId ->
             connections.sendPayload(endpointId, payload)
@@ -447,6 +540,9 @@ class MainActivity : ComponentActivity() {
                     }
                 }
         }
+
+        status = "Сообщение отправляется..."
+        return true
     }
 
     private fun loadMessages() {
@@ -456,7 +552,9 @@ class MainActivity : ComponentActivity() {
             JSONArray()
         }
 
-        for (i in 0 until array.length()) {
+        val firstIndex = maxOf(0, array.length() - MAX_MESSAGES)
+
+        for (i in firstIndex until array.length()) {
             val item = array.optJSONObject(i) ?: continue
 
             messages.add(
@@ -472,7 +570,7 @@ class MainActivity : ComponentActivity() {
     private fun saveMessages() {
         val array = JSONArray()
 
-        messages.takeLast(100).forEach {
+        messages.takeLast(MAX_MESSAGES).forEach {
             array.put(
                 JSONObject()
                     .put("text", it.text)
@@ -525,7 +623,11 @@ class MainActivity : ComponentActivity() {
                 shape = RoundedCornerShape(16.dp)
             ) {
                 Column(Modifier.padding(16.dp)) {
-                    Text("ТВОЙ ПРОФИЛЬ", color = Muted, fontSize = 10.sp)
+                    Text(
+                        "ТВОЙ ПРОФИЛЬ",
+                        color = Muted,
+                        fontSize = 10.sp
+                    )
 
                     Spacer(Modifier.height(5.dp))
 
@@ -579,23 +681,42 @@ class MainActivity : ComponentActivity() {
 
                     Spacer(Modifier.height(5.dp))
 
-                    Text(status, color = Color.White, fontSize = 12.sp)
+                    Text(
+                        status,
+                        color = Color.White,
+                        fontSize = 12.sp
+                    )
 
                     Spacer(Modifier.height(10.dp))
 
                     Button(
                         onClick = {
-                            if (online) stopNearby()
-                            else requestOnline()
+                            if (online || startingNearby) {
+                                stopNearby()
+                            } else {
+                                requestOnline()
+                            }
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (online) Color(0xFF8B4050) else Mint,
-                            contentColor = if (online) Color.White else Bg
+                            containerColor = if (online || startingNearby) {
+                                Color(0xFF8B4050)
+                            } else {
+                                Mint
+                            },
+                            contentColor = if (online || startingNearby) {
+                                Color.White
+                            } else {
+                                Bg
+                            }
                         )
                     ) {
                         Text(
-                            if (online) "Отключить поиск" else "Включить поиск устройств"
+                            when {
+                                online -> "Отключить поиск"
+                                startingNearby -> "Отменить запуск"
+                                else -> "Включить поиск устройств"
+                            }
                         )
                     }
                 }
@@ -629,6 +750,7 @@ class MainActivity : ComponentActivity() {
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text(peer.name, color = Color.White)
+
                         Text(
                             peer.endpointId.take(8),
                             color = Muted,
@@ -652,7 +774,11 @@ class MainActivity : ComponentActivity() {
             )
 
             connected.values.forEach {
-                Text("● $it", color = Color.White, fontSize = 11.sp)
+                Text(
+                    "● $it",
+                    color = Color.White,
+                    fontSize = 11.sp
+                )
             }
 
             Spacer(Modifier.height(10.dp))
@@ -675,7 +801,11 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier
                             .fillMaxWidth()
                             .background(
-                                if (message.mine) Color(0xFF17483F) else Panel,
+                                if (message.mine) {
+                                    Color(0xFF17483F)
+                                } else {
+                                    Panel
+                                },
                                 RoundedCornerShape(12.dp)
                             )
                             .padding(10.dp)
@@ -711,8 +841,9 @@ class MainActivity : ComponentActivity() {
 
                 Button(
                     onClick = {
-                        sendMessage(draft)
-                        draft = ""
+                        if (sendMessage(draft)) {
+                            draft = ""
+                        }
                     }
                 ) {
                     Text("➤")
@@ -736,15 +867,20 @@ class MainActivity : ComponentActivity() {
                 text = {
                     Column {
                         Text("Устройство: ${request.name}")
+
                         Spacer(Modifier.height(10.dp))
+
                         Text("Код подтверждения:")
+
                         Text(
                             request.digits,
                             color = Mint,
                             fontSize = 25.sp,
                             fontWeight = FontWeight.Bold
                         )
+
                         Spacer(Modifier.height(8.dp))
+
                         Text(
                             "Сравни код на обоих устройствах. При несовпадении отклони запрос.",
                             color = Muted
@@ -766,6 +902,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        startAttempt++
+
         if (::connections.isInitialized) {
             connections.stopAdvertising()
             connections.stopDiscovery()
